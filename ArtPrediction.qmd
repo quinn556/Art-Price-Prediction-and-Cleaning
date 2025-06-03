@@ -1,0 +1,918 @@
+---
+title: "Price of Art Prediction"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+
+This data set comes from the Kaggle competition of my professor in graduate school. It contains information about the price of art at auctions with other variables that give more details. The outcome variable for this is the price realized. The data is incredibly messy so this project will focus on cleaning large data and EDA, in order to get this really model ready.
+
+## Note
+
+Just noting that once I got down to doing the actual modeling, I discovered my computer does not have enough RAM to actually run and tune the models. I was going to try Lasso, Ridge, as well as XGBoosting models. XGBoost is the only model that has a chance at running on large data like this. This will just be an example of cleaning messy data even if the models fail because of insufficient computing power. R crashes when trying to tune lasso and ridge.
+
+```{r}
+library(tidyverse)
+library(corrplot)
+library(scales)
+library(tidymodels)
+library(doParallel)
+library(themis)
+library(vip)
+library(naniar)
+library(stringi)
+library(usethis)
+library(e1071)
+
+data <- read_csv("train.csv")
+```
+
+# EDA and Manipulation
+
+So this data set is absolutely huge with about 98,000 pieces of art. Let's take a closer look.
+
+```{r}
+dim(data)
+```
+
+A lot of variables here will need cleaning and changing of data types. There will be a lot of transformation to come.
+```{r}
+glimpse(data)
+```
+
+## Looking NA Values
+
+Now I believe this data is full of NA values. I'll need to get a better look at how to handle that.
+
+```{r}
+# get count NA values
+colSums(is.na(data))
+```
+
+The graph is a better visual of of which columns have the most NA values.
+```{r}
+#Plotting missing values
+data %>% 
+  gg_miss_var(show_pct = TRUE)
+```
+
+I think I will take a look at the NA values one more time later on after manipulation and potentially dropping columns I don't need. I'll try to parse out any information I can, but there will be columns that are dummy variables indicating if some thing was exhibited, if literature available, if has provenance, etc.
+
+The data is so large, I'm going to drop the NA columns in the auction column because ~1,200 isn't that much in the scheme of this data set and I can't pull any information out of something that isn't there. NA values here indicate there is no information on the auction type.
+
+```{r}
+data <- data %>% 
+  drop_na(auction)
+```
+
+## Manipulation
+
+There's a lot to tackle here so let's get into it. I want to clean up the data before really doing more EDA. I'll deal with location first and create regions.
+
+```{r}
+unique(data$location)
+```
+```{r}
+#Replace NA values in location with "Other
+data <- data %>% 
+  mutate(location = replace_na(data$location,"Other"))
+
+data <- data %>% 
+  mutate(region = case_when(
+    location %in% c("Hong Kong", "Dubai","Shanghai", "Mumbai") ~ "Asia/Mid East",
+    location %in% c("London", "London (South Kensigton)", "Amsterdam", "Zürich", "Milan", "Paris", "Geneva") ~ "Europe",
+    location == "New York" ~ "North America",
+    location == "Other" ~ "Other"
+  ))
+
+#The data set is already large so I'll just combine both London values
+data <- data %>% 
+ mutate(city = case_when(
+   grepl("London",location) ~ "London",
+   grepl("Hong", location) ~ "Hong Kong",
+   grepl("New York",location) ~ "New York",
+   grepl("Amsterdam", location) ~ "Amsterdam",
+   grepl("Zürich", location) ~ "Zürich",
+   grepl("Milan", location) ~ "Milan",
+   grepl("Paris", location)~"Paris",
+   grepl("Dubai", location)~"Dubai",
+   grepl("Geneva", location)~"Geneva",
+   grepl("Shanghai", location)~"Shanghaii",
+   grepl("Mumbai", location)~"Mumbai"
+ ))
+  
+data$city <- as.factor(data$city)
+
+data %>% 
+  group_by(region) %>%
+  summarise(Count = n())
+```
+
+Here I will create a grouped size column as a factor. I think it would make more sense to have groups of size rather than unique numbers, especially for a data set this size.
+
+```{r}
+#Change to numeric
+data$width_cm <- as.numeric(data$width_cm)
+data$height_cm <- as.numeric(data$height_cm)
+
+#Create size in cm column
+data <- data %>% 
+  mutate(size_cm = width_cm * height_cm)
+
+data$size_cm <- round(data$size_cm)
+data$size_cm <- as.numeric(data$size_cm)
+
+#See breakdown with histogram. It may be more valuable to turn this into a categorical variable
+data %>% 
+  na.omit(size_cm) %>% 
+  ggplot(aes(x = size_cm))+
+  geom_histogram()
+
+#Group size into categorical variable
+data <- data %>% 
+  mutate(size = case_when(
+    size_cm > 0 & size_cm <=1000 ~ "Very Small",
+    size_cm > 1000 & size_cm <= 30000 ~ "Small",
+    size_cm > 30000 & size_cm <= 60000 ~ "Medium",
+    size_cm > 60000 ~ "Large",
+    
+  ))
+
+# Replace NAs
+data$size <- replace_na_with(data$size, "No dimensions")
+
+data %>% 
+  group_by(size) %>%
+  summarise(count = n())
+```
+
+Now some columns are extremely messy with a lot of different text contained. For now, let me just create dummy columns to say 1 if there is provenance, exhibited, etc.
+
+```{r}
+# 0 if it was not exhibited
+data <- mutate(data, was_exhibited = if_else(is.na(exhibited), 0, 1))
+
+# 0 if it has no provenance available
+data <- mutate(data, has_provenance = ifelse(is.na(provenance), 0, 1))
+
+# 0 if no literature available on piece of art
+data <- mutate(data, lit_avail = ifelse(is.na(literature), 0, 1))
+
+# 0 if piece is not signed, 1 if it's signed
+data <- data %>%
+    mutate(signed = case_when(
+    str_detect(details, "(?i)\\bsigned\\b") ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  mutate(signed = ifelse(signed == TRUE, 1,0))
+
+# Creating a framed variable. 1 if framed
+data <- data %>%
+    mutate(framed = case_when(
+    str_detect(details, "(?i)\\bframe\\b") ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  mutate(framed = ifelse(framed == TRUE, 1,0))
+
+#Create a column to note if piece comes from a private collection or was in one
+data <- data %>%
+    mutate(private_collection = case_when(
+    str_detect(provenance, "(?i)\\bprivate\\b") ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  mutate(private_collection = ifelse(private_collection == TRUE, 1,0))
+```
+
+Changing the date column to "date_exhibited" because that's what it seems like the date column tells me. Then I think I'll just change that to the year it was exhibited. I may end up getting rid of the date column related to exhibition because I don't think that would play a role in price unless the artist died recently.
+
+```{r}
+data <- data %>% 
+  mutate(year_sold = format(as.Date(data$date, format="%Y/%m/%d"),"%Y")) %>% 
+  select(-date) # I don't need this date column anymore
+```
+
+Alright now let me get a look at all the artists in the data. This is going to be one of the trickier variables to clean.
+
+There are many entries that may have some white space or leading white space because I'm seeing multiple instances of the same artist, possibly with typos as well. The dates could come in handy later if I choose to create a variable for if the artist has died or not. First off, I need to clean these names. I see some names have an apostrophe or other different characters and some do not. I'll take care of these here.
+
+```{r}
+#Regex to get rid of date in name
+data <- data %>%
+  mutate(artist = str_remove(artist, "\\(\\d{4}-\\d{4}\\)"))
+
+data <- data %>%
+  mutate(artist = str_remove(artist, "\\s*\\([^\\)]*\\)"))
+
+#Trim whitespace
+data <- data %>%
+  mutate(artist = str_trim(artist, side = "both"))
+
+#Standardize the names to upper case
+data$artist <- toupper(data$artist)
+
+#Let's look at our results
+data %>% 
+  group_by(artist) %>%
+  summarise(Count = n()) %>% 
+  arrange(desc(Count))
+
+# library(stringi) used for the function below
+
+data <- data %>%
+  mutate(artist = stri_trans_general(artist, "Latin-ASCII"))
+
+#Get rid of "ATTRIBUTED TO" in columns
+data <- data %>%
+  mutate(artist = str_remove(artist, regex("ATTRIBUTED TO ", ignore_case = TRUE)))
+
+#Getting rid of data that has no name of artist and is just a title of art
+data <- data %>%
+  arrange(artist) %>%
+  dplyr::slice((1218):n())
+
+#Further cleaning to make sure I got everything.
+data <- data %>%
+  mutate(
+    artist = artist %>%
+      str_replace_all("[\n\t]", " ") %>%                              # Remove newline & tab
+      str_remove_all("(?i)\\b(attributed to|circle of|follower of|school of)\\b") %>%  # Remove attributions
+      str_remove_all("\\(.*?\\)") %>%                                 # Remove anything in parentheses
+      str_remove_all(",.*") %>%                                       # Remove anything after a comma
+      str_replace_all("\\.", "") %>%                                  # Remove periods from initials
+      str_replace_all("-", " ") %>%                                   # Replace dashes with space
+      str_replace_all("\\s+", " ") %>%                                # Replace multiple spaces with one
+      str_trim() %>%                                                  # Trim leading/trailing spaces
+      str_to_upper()                                                  # Convert to uppercase
+  )
+
+```
+
+I want to alter the price columns slightly by rounding them. It's standard practice to also take the log of a numeric price column when that's the outcome variable.
+
+```{r}
+data$price_realized_usd <- round(as.numeric(data$price_realized_usd))
+data$estimate_low_usd <- round(as.numeric(data$estimate_low_usd))
+data$estimate_high_usd <- round(as.numeric(data$estimate_high_usd))
+```
+
+The auction column is basically just a shorter description column. I'll try to standardize or pull out certain topics. For example, if it contains strings that mention a certain time period or art style. The auction column is the title of the auction. Maybe the new column could be auction type?
+
+Here I am trying to pull categories out of the auction column because there is a bunch of valuable data in there as a huge string. This will at least kind of group it together. There may be a better way to do this, but this works currently. The new category will tell me what kind of auction was held.
+```{r}
+data <- data %>%
+    dplyr::mutate(auction_category = case_when(
+        str_detect(auction, regex("Contemporary|Post-War", ignore_case = TRUE)) ~ "Contemporary Art",
+        str_detect(auction, regex("Modern|Impressionist", ignore_case = TRUE)) ~ "Modern Art",
+        str_detect(auction, regex("Old Masters|19th Century|Victorian", ignore_case = TRUE)) ~ "Classical / Old Masters",
+        str_detect(auction, regex("Chinese|Asian|South Asian", ignore_case = TRUE)) ~ "Asian Art",
+        str_detect(auction, regex("Latin American", ignore_case = TRUE)) ~ "Latin American Art",
+        str_detect(auction, regex("British|Scottish|Irish", ignore_case = TRUE)) ~ "British Art",
+        str_detect(auction, regex("American", ignore_case = TRUE)) ~ "American Art",
+        TRUE ~ "Other"
+    ))
+```
+
+I want to pull out the data to describe what the medium of the art was or at least what was used to create the art.
+```{r}
+data <- data %>%
+    dplyr::mutate(medium = case_when(
+        str_detect(details, regex("oil", ignore_case = TRUE)) ~ "Oil Painting",
+        str_detect(details, regex("pencil", ignore_case = TRUE)) ~ "Pencil",
+        str_detect(details, regex("acrylic", ignore_case = TRUE)) ~ "Acrylic",
+        str_detect(details, regex("charcoal", ignore_case = TRUE)) ~ "Charcoal",
+        str_detect(details, regex("spraypaint", ignore_case = TRUE)) ~ "Spray Paint",
+         str_detect(details, regex("spray paint", ignore_case = TRUE)) ~ "Spray Paint",
+         str_detect(details, regex("watercolour", ignore_case = TRUE)) ~ "Watercolor",
+         str_detect(details, regex("watercolor", ignore_case = TRUE)) ~ "Watercolor",
+        str_detect(details, regex("silkscreen", ignore_case = TRUE)) ~ "Silkscreen",
+        str_detect(details, regex("pastel", ignore_case = TRUE)) ~ "Pastel",
+        str_detect(details, regex("etch", ignore_case = TRUE)) ~ "Etching",
+        TRUE ~ "Other"
+    ))
+```
+
+# Creating New Data and Finishing Cleaning
+
+```{r}
+
+#Change all characters to factors
+data <- data %>% 
+  mutate_if(is.character,factor) %>% 
+  drop_na(artist) #Drop NA artist values (3)
+
+#Change binary variables to factors. I'm sure there is a better way to do this, but this works fine for now
+
+data$was_exhibited <- as.factor(data$was_exhibited)
+data$has_provenance <- as.factor(data$has_provenance)
+data$lit_avail <- as.factor(data$lit_avail)
+data$signed <- as.factor(data$signed)
+data$framed <- as.factor(data$framed)
+data$private_collection <- as.factor(data$private_collection)
+
+data$object_id <- as.character(data$object_id)
+
+data <- data %>% 
+  rename(price = price_realized_usd) %>% 
+  mutate(log_price = log(price))
+```
+
+# Visuals and EDA
+
+Look at break down of the log of price.
+
+```{r}
+#Nice normal distribution
+data %>% 
+  ggplot(aes(x = log_price))+
+  geom_density()
+```
+
+Taking a look at the cities by log price, Milan has a higher median price.
+
+```{r}
+data %>% 
+  ggplot(aes(x = city, y = log_price))+
+  geom_boxplot() +
+  scale_x_discrete(guide = guide_axis(angle = 45))
+```
+
+Now I want to go through those binary columns and see if there's actually a difference in price.
+
+So pieces of art that were exhibited before sell for slightly more amount of money.
+
+```{r}
+data %>% 
+  ggplot(aes(x = was_exhibited, y = log_price))+
+  geom_boxplot()+
+  labs(title = "Relationship between log price and exhibited")
+```
+
+If a piece has provenance, it sells for a little more.
+
+```{r}
+data %>% 
+  ggplot(aes(x = has_provenance, y = log_price))+
+  geom_boxplot()+
+  labs(title = "Relationship between log price and provenance")
+```
+
+If there was any literature at all associated with the piece when it was auctioned, it sold for more.
+```{r}
+data %>% 
+  ggplot(aes(x = lit_avail, y = log_price))+
+  geom_boxplot()+
+  labs(title = "Relationship between log price and literature available")
+```
+
+Here there is not much difference in price for whether a piece was signed or not. I thought this difference would be more significant.
+
+```{r}
+data %>% 
+  ggplot(aes(x = signed, y = log_price))+
+  geom_boxplot()+
+  labs(title = "Relationship between log price and if signed")
+```
+
+If a piece of art was framed or not doesn't appear to make a difference in price.
+
+```{r}
+data %>% 
+  ggplot(aes(x = framed, y = log_price))+
+  geom_boxplot()+
+  labs(title = "Relationship between log price and if framed")
+```
+
+When art comes from a private collection, it fetches more at auction.
+
+```{r}
+data %>% 
+  ggplot(aes(x = private_collection, y = log_price))+
+  geom_boxplot()+
+  labs(title = "Relationship between log price and if in private hands")
+```
+
+Okay so I definitely learned some valuable information from these quick graphs. These binary variables simply show there are certain things that influence sale price.
+
+```{r}
+#Recode levels for graphing
+data$size <- factor(data$size, levels = c("No dimensions","Very Small", "Small","Medium", "Large"))
+
+data %>% 
+  ggplot(aes(x = size, y = log_price, fill = size))+
+  geom_boxplot(show.legend = FALSE)+
+  labs(title = "Log price and size of art")
+```
+
+Overall, we can assume the larger the art, the higher the sale price. There is an obvious visual trend that shows this. I'm assuming that if there is not a dimension value for a piece of art, it was either a physical sculpture or there was no available size information. I'll take a quick look to confirm or deny that.
+
+```{r}
+data %>% 
+  filter(size == "No dimensions") %>% 
+  group_by(medium) %>% 
+  summarize(Count = n())
+```
+
+There are 7,303 pieces of art with no dimensions that are also in the Other category for medium type.
+
+```{r}
+data %>% filter(size == "No dimensions" & medium == "Other") %>% 
+  select(details) %>% 
+  head(10)
+```
+
+I will not print it all out here, but the Other category for medium tends to have descriptions in a different language or are hyper specific. They also tend to have sculptures of figures.
+
+```{r}
+data %>% 
+  ggplot(aes(x = region, y = log_price, fill = region))+
+  geom_boxplot(show.legend = FALSE)+
+  labs(title = "Log price and region location")
+```
+
+While I wouldn't call this much of a difference, I can see art sold in Asia and the US typically fetch higher prices at auction when compared to if a piece was auctioned in Europe. I'll want to break it down a little further and see if there is a difference in specific cities.
+
+```{r}
+data %>% 
+  ggplot(aes(x = city, y = log_price, fill = city))+
+  geom_boxplot(show.legend = FALSE)+
+  labs(title = "Log price and city") +
+  scale_x_discrete(guide = guide_axis(angle = 45))
+```
+
+Art sold in New York, London, Hong Kong, and Shanghai generally go for higher prices compared to other cities. This could be the fact that prominent auction houses typically hold their auctions in those cities. London (SK) brings in the lowest amount of money from auctions, followed by Amsterdam.
+
+Let's see now if there was a particularly good year for art auctions and then look at sale prices based on location.
+
+```{r}
+data %>% 
+  ggplot(aes(x = year_sold, y = log_price, fill = year_sold))+
+  geom_boxplot(show.legend = FALSE)+
+  labs(title = "Log price and size of art")
+```
+
+I'm not seeing anything too significant, but medians tend to trend on a slight upward angle as time goes on. Also worth noting, I do not care about outliers in price with this data because the price of art can be highly inflated at times. On the contrary, there can also be quite good deals.
+
+```{r}
+data %>% 
+  ggplot(aes(x = size, fill = medium))+
+  geom_bar() +
+  scale_x_discrete(guide = guide_axis(angle = 45))+
+  labs(x = "Size of art", title = "Art type medium by size", y = "Count")
+```
+
+Oil paintings take up a large portion of art that is considered small.
+
+I now want to see if a certain region focuses on particular pieces of art. As expected, Asian countries deal mostly with Asian art. North America looks also focus on contemporary art, while Europe is more focused on Modern art. Of course the column auction_category is built off is quite messy so I can't pull out all the nuanced categories.
+```{r}
+data %>% 
+  ggplot(aes(x = region, fill = auction_category))+
+  geom_bar(position = "dodge") +
+  scale_x_discrete(guide = guide_axis(angle = 45))+
+  labs(x = "Region", title = "Art category by region", y = "Count")
+```
+
+Below I'll look at a break down on price in relation to artists. I want to see what the max price a piece sold for under each artist, the mean price, and who is the most represented in the data.
+
+Art by Chen Rong sells for on average the highest amount of money with a mean of $48,967,500. Wow. The top five highest averages are from Chen Rong, Emanuel Leutze, Francis Bacon, Raffaello Sanzio, and Michaelangelo Buonarroti.
+```{r}
+data %>% 
+  group_by(artist) %>% 
+  summarize(mean_price = mean(price)) %>% 
+  arrange(desc(mean_price)) %>% 
+  head(10)
+```
+
+If we're looking at the artists who appear most in the data, it's Andy Warhol with 598 pieces auctioned. You can see there is ANONYMOUS that appears here. Funny to note that there are many pieces that are unnamed to people. Let's take a quick detour and see how much their art sells for.
+```{r}
+data %>% 
+ count(artist) %>% 
+  arrange(desc(n)) 
+```
+
+```{r}
+data %>% 
+  filter(artist == "ANONYMOUS") %>% 
+  summarise(mean_price = mean(price))
+```
+
+Ok so art under Anon typically goes for about $67,300. What's the most expensive?
+
+```{r}
+data %>% 
+  filter(artist == "ANONYMOUS") %>% 
+  summarise(max_price = max(price))
+```
+
+Woah, $2.6 million is the most a piece went for under Anon. Now I want to see what the most expensive piece each artist sold and then the most expensive piece sold by city.
+
+```{r}
+#Max price per artist
+data %>% 
+  group_by(artist) %>% 
+  summarize(max_price = max(price)) %>% 
+  arrange(desc(max_price)) %>% 
+  head(10)
+```
+
+As expected, some of the biggest names in art history sold the most expensive pieces. From Rothko to Picasso, they command tens of millions.
+
+```{r}
+#Most expensive piece per city
+options(scipen=999)
+
+data %>% 
+  group_by(city) %>% 
+  summarize(max_price = max(price)) %>% 
+  ggplot(aes(x = city, y = max_price, color = city))+
+  geom_point() +
+  scale_x_discrete(guide = guide_axis(angle = 45))+
+  labs(title = "Most expensive piece of art price sold at each city ")
+```
+
+New York, London, and Hong Kong have sold pieces of art worth the most amount of money.
+
+# Note Before Modeling
+
+I think I've cleaned the data pretty well and added variables that help explain the price of art. Just noting for myself that if model performs poorly, I may want to go back and create even more variables that parse for further information like if a piece was exhibited at a top 5 art museum (Guggenheim, etc.). I'll have to brainstorm that more.
+
+Also I'm going to get rid of any columns I do not need anymore below.
+```{r}
+data <- data %>% 
+  select(-estimate_low_usd,-height_cm,-width_cm,-size_cm,-provenance,-exhibited,-literature,-location,-auction, - details,-category,-original_currency, -estimate_high_usd,-city,-object_id) 
+
+```
+
+# Statistics
+
+```{r}
+summary(aov(log_price~ region, data = data))
+```
+
+There is strong evidence that log price significantly differs by region.
+
+```{r}
+TukeyHSD(aov(log_price ~ region, data = data))
+```
+
+
+```{r}
+summary(aov(log_price ~ auction_category, data = data))
+```
+
+```{r}
+summary(aov(log_price ~ medium, data = data))
+```
+
+```{r}
+summary(aov(log_price ~ year_sold, data = data))
+```
+
+```{r}
+summary(aov(log_price ~ size, data = data))
+```
+
+There are a lot of statistically significant variables here. Already region, auction_category, and medium. have significant differences in mean of log price.
+
+## Checking for skewness and kurtosis of outcome 
+
+```{r}
+skewness(data$log_price, na.rm = TRUE)
+```
+
+Outcome variable is still symmetric. It's between 0 and 0.5 so it's okay.
+```{r}
+kurtosis(data$log_price, na.rm = TRUE)
+```
+
+# Modeling
+
+The data set is so large, but I was able to manipulate and tune so the models could actually run on my computer. The project was delayed a day because my computer would crash if I ran the models below with the large data sets. Fortunately, Everything seems to work at this point.
+
+## Data Split
+
+```{r}
+set.seed(222)
+
+data <- data %>% 
+  select(-price)
+
+split <- initial_split(data,strata = log_price) #strata is always predictor
+train <- training(split)
+test <- testing(split)
+
+```
+
+## Recipe Creation
+
+Lasso regression requires center and scale data. I do that with step normalize. This recipe will also work for the other ridge and boosted model.
+```{r}
+#Create model recipe
+recipe <- recipe(log_price ~.,data = train) %>% 
+  #update_role(object_id, new_role = "ID") %>%  Just ended up getting rid of id column
+  step_other(artist, threshold = 200) %>% 
+ step_dummy(all_nominal_predictors())# %>%
+  #step_zv(all_predictors())
+
+
+#Double check recipe
+prep <- prep(recipe)
+#juice(prep)
+
+#Check if variables were grouped properly
+
+#juice(prep) %>% count(artist)
+```
+
+So it looks like because I am making nominal predictors into dummy variables, it's ballooning the data set, which may cause the crashing.
+
+BREAKTHROUGH! Well, possibly. I'm using step_other to condense the artist column and group artists into an other category.I'm not a huge fan of this, but it may be the only way to actually get the model to run since there are so many categorical variables.
+
+## Creating Model Specifications
+
+```{r}
+#0 is ridge regression, 1 is lasso. 
+
+lasso_mod <- linear_reg(penalty = tune(),
+                        mixture = 1,
+                        mode = "regression"
+                        ,engine = "glmnet")
+
+ridge_mod <- linear_reg(penalty = tune(),
+                        mixture = 0,
+                        mode = "regression",
+                        engine ="glmnet")
+
+#XGBoost
+boost_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(), loss_reduction = tune(),
+  learn_rate = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+```
+
+## Resampling with Cross Validation and Bootstrap
+
+```{r}
+set.seed(34746844)
+
+folds <- vfold_cv(train, v = 10, strata = log_price)
+
+boots <- bootstraps(train, strata = log_price)
+```
+
+## Model Workflows
+
+Here I'm creating the workflows to be used to create the models.
+
+```{r}
+
+#Lasso
+lasso_wf <- workflow() %>%
+  add_recipe(recipe) %>% 
+  add_model(lasso_mod)
+
+#Ridge
+ridge_wf <- workflow() %>%
+  add_recipe(recipe) %>% 
+  add_model(ridge_mod)
+
+#boost
+boost_wf <- workflow() %>% 
+  add_recipe(recipe) %>% 
+  add_model(boost_spec)
+
+```
+
+## Tune XGBoost
+
+```{r}
+#xgboost tuning
+set.seed(4444)
+
+doParallel::registerDoParallel()
+
+xgb_grid <- grid_space_filling(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train),
+  learn_rate(),
+  size = 30 #Can always change this to train more or less than 20 models
+)
+
+#xgboost tuning process
+doParallel::registerDoParallel()
+
+set.seed(222)
+
+xgb_res <- tune_grid(
+  boost_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+
+I'm also going to try tuning with racing methods in the finetune package to see if there is a difference in model performance.
+```{r}
+
+library(finetune)
+doParallel::registerDoParallel()
+
+set.seed(222)
+
+race_tune_boost <- tune_race_anova(
+  boost_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_race(save_pred = TRUE)
+)
+```
+
+
+Collect the metrics and show best performing model.
+
+```{r}
+
+#Show best tuned xgboost with racing methods
+best_racing <- select_best(race_tune_boost, metric = "rmse")
+
+
+#Here are the top 5 best performing models on the training set
+show_best(xgb_res, metric = "rmse")
+  
+#Selecting the best performing boost model
+best_xgb <- select_best(xgb_res, metric = "rmse")
+
+#Finalizing and building the final model
+final_xgb_race  <- finalize_workflow(boost_wf, best_racing)
+
+final_xgb  <- finalize_workflow(boost_wf, best_xgb)
+```
+
+## Variable Importance for XGBoost
+
+Alright let's look at which variables were the most influential in predicting log price.
+```{r}
+final_xgb %>% 
+  fit(data = train) %>% 
+  pull_workflow_fit() %>% 
+  vip(geom = "point")
+```
+
+The boosted model did not rely too much on what artist did the painting, but more different attributes of the piece of art. Things like whether literature was available, whether the piece had provenance, exhibited, were more important to this model. I'll see later how accurate it is compared to the other ML models built out.
+
+## Fit the Final Boosted Model
+
+```{r}
+#Racing tuned
+final_racing_xgboost <- last_fit(final_xgb_race, split)
+
+final_result_xgboost <- last_fit(final_xgb, split)
+
+#Look at results
+
+final_result_xgboost %>% 
+  collect_metrics()
+
+final_racing_xgboost %>% 
+  collect_metrics()
+```
+
+These metrics are kind of disappointing. It indicates that the model did not perform well on the test data set. This is not too bad though for super messy data. And the two models with different tuning methods are essentially the same. So no real difference there.
+
+Overall the RMSE for the training and test sets should be similar if the model built is good. If it's vastly different, it could indicate poor fitting on data.
+
+## Create grid penalty for ridge and lasso
+```{r}
+
+lambda_grid <- grid_regular(penalty(),
+                            levels = 50)
+```
+
+## Ridge Tuning
+
+```{r}
+ridge_wf_tune <- tune_grid(ridge_wf,
+                             resamples = folds,
+                            grid = lambda_grid,
+                           control = control_resamples(save_pred = TRUE)
+)
+
+
+#Select best rmse tuning
+best_ridge_tune <- ridge_wf_tune %>% 
+  select_best(metric = "rmse")
+
+
+final_result_ridge <- finalize_workflow(ridge_wf, best_ridge_tune)
+
+
+#Variable importance
+final_result_ridge %>% 
+  fit(train) %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+This ridge regression model uses many of the artist values in the artist column to predict log price. It looks like the size and literature available play a significant role in training.
+
+# Predict on Test Set with Ridge
+
+```{r}
+last_ridge <- last_fit(final_result_ridge, split)
+
+last_fit(final_result_ridge, split) %>% 
+  collect_metrics()
+```
+
+## Tuning Lasso with Bootstrap
+
+```{r}
+set.seed(4444)
+
+#doParallel::registerDoParallel()
+
+lasso_grid <- tune_grid(
+  lasso_wf,
+  resamples = boots,
+  grid = lambda_grid
+)
+
+
+lasso_grid %>% 
+  collect_metrics()
+
+best_lasso <- lasso_grid %>% select_best(metric = "rmse")
+
+final_lasso <- finalize_workflow(lasso_wf,best_lasso)
+```
+
+Let's look at the most important variables in determining price of a piece of art.
+```{r}
+final_lasso %>% 
+  fit(train) %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+  #vi(lambda = best_lasso$penalty)
+```
+
+This lasso model used a lot of the artist values to determine the log price. I find that a bit problematic as that variable has so much variability and can't really be condensed anymore than it is. Literature available and if the size was large appear to be pretty influential. The ridge and lasso models are quite similar in their prediction and training scores.
+
+Here I will fit the final lasso model.
+```{r}
+last_lasso <- last_fit(final_lasso,
+         split)
+
+last_lasso %>% collect_metrics()
+
+```
+
+Alright so all these RMSE scores are a little too high. ~1.4 is way too high for me. It indicates poor model performance on the test data. 
+
+#Model Comparison
+
+Below I will compare the models on the testing data set. I'll see which ones performed best with the best scores on the test set through a visualization.
+```{r}
+mod_res <- tibble(model = list(last_lasso, last_ridge, final_result_xgboost),
+                  model_name = c("lasso","ridge","xgboost"))
+```
+
+```{r}
+#Create helper function for collecting metrics
+map_collect_metrics <- function(model){
+  
+  model %>% 
+    select(id,.metrics) %>% 
+    unnest
+}
+
+#Apply helper function and extract metrics
+mod_res <- mod_res %>% 
+  mutate(res = map(model,map_collect_metrics)) %>% 
+  select(model_name, res) %>% 
+  unnest(res)
+```
+
+These two graphs she me the xgboost model performs better than lasso and ridge regression models. Now the xgboost model doesn't perform too well, but it definitely has best metrics.
+```{r}
+#Compare models visual
+mod_res %>% 
+  ggplot(aes(x = model_name, y = .estimate))+
+  geom_point()+
+  facet_wrap(~.metric, scales = "free_y")+
+  labs(title = "Comparison of model scores")
+```
+
+# Conclusion
+
+Overall, I was able to tame a large and messy data set and get out some solid analysis with cleaned variables. The most challenging aspect was really getting the models to run without crashing my computer. I went back a few times to refine the feature engineering aspect of the project. The XGBoost model performs the best out of the two other regression models. When looking at variable importance for the models, they looked at different variables to help predict log price.
+
+I'd like to run a random forest model since the xgboost did the best, but I also don't want to crash my computer again and again to find the best parameters so I will not go forward with a random forest unfortunately.
